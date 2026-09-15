@@ -1,6 +1,7 @@
 // ============================================
 //  🦊 Fox Eggs Webhook Server
-//  Storage: File-based (persistent on Volume)
+//  - Persistent storage (Volume)
+//  - Auto cleanup (72h) on every startup
 // ============================================
 
 const express = require('express');
@@ -15,12 +16,15 @@ app.use(cors());
 app.use(express.json());
 
 // ============================================
-//  💾 مسیر ذخیره‌سازی (روی Volume)
+//  💾 مسیر ذخیره‌سازی
 // ============================================
 const DATA_DIR = process.env.DATA_DIR || '/app/data';
 const DB_FILE = path.join(DATA_DIR, 'referrals.json');
 
-console.log(`📁 DB File Path: ${DB_FILE}`);
+// ⏰ حداکثر عمر Referral (۷۲ ساعت)
+const MAX_AGE_MS = 72 * 60 * 60 * 1000;
+
+console.log(`📁 DB File: ${DB_FILE}`);
 
 // ============================================
 //  💾 توابع مدیریت فایل
@@ -39,9 +43,7 @@ function ensureDir() {
 function readDB() {
     try {
         ensureDir();
-        if (!fs.existsSync(DB_FILE)) {
-            return {};
-        }
+        if (!fs.existsSync(DB_FILE)) return {};
         const raw = fs.readFileSync(DB_FILE, 'utf8');
         return JSON.parse(raw || '{}');
     } catch (e) {
@@ -62,7 +64,56 @@ function writeDB(data) {
 }
 
 // ============================================
-//  📝 ثبت‌نام Referral
+//  🧹 پاک‌سازی Referral های قدیمی
+// ============================================
+function cleanupOldReferrals() {
+    console.log('🧹 Auto-cleanup started...');
+
+    const db = readDB();
+    const now = Date.now();
+    let removed = 0;
+    let kept = 0;
+
+    for (const code in db) {
+        const list = db[code];
+
+        if (!Array.isArray(list)) {
+            db[code] = [];
+            continue;
+        }
+
+        const filtered = list.filter(entry => {
+            // فرمت قدیمی (string): نگه دار
+            if (typeof entry === 'string') return true;
+
+            // فرمت جدید (object): بر اساس timestamp
+            const ts = entry.timestamp || 0;
+            const age = now - ts;
+            return age < MAX_AGE_MS;
+        });
+
+        removed += list.length - filtered.length;
+        kept += filtered.length;
+        db[code] = filtered;
+    }
+
+    // پاک کردن کدهای خالی
+    for (const code in db) {
+        if (db[code].length === 0) {
+            delete db[code];
+        }
+    }
+
+    if (removed > 0) {
+        writeDB(db);
+        console.log(`✅ Cleanup done: removed=${removed}, kept=${kept}`);
+    } else {
+        console.log(`✅ Cleanup done: nothing to remove (kept=${kept})`);
+    }
+}
+
+// ============================================
+//  📝 ثبت Referral
 // ============================================
 app.post('/api/register', (req, res) => {
     const { userId, refCode, timestamp } = req.body;
@@ -103,13 +154,13 @@ app.post('/api/register', (req, res) => {
             res.json({ success: false, error: 'write_failed' });
         }
     } else {
-        console.log(`⚠️ Duplicate ignored: ${userId}`);
+        console.log(`⚠️ Duplicate: ${userId}`);
         res.json({ success: true, message: 'Already registered' });
     }
 });
 
 // ============================================
-//  📊 گرفتن لیست Referral ها
+//  📊 گرفتن Referrals
 // ============================================
 app.get('/api/referrals/:refCode', (req, res) => {
     try {
@@ -128,29 +179,25 @@ app.get('/api/referrals/:refCode', (req, res) => {
             referrals: userIds
         });
     } catch (e) {
-        console.error('❌ Error in /api/referrals:', e.message);
-        res.json({ success: false, error: 'server_error' });
+        console.error('❌ Error:', e.message);
+        res.json({ success: false, referrals: [] });
     }
 });
 
 // ============================================
-//  📊 آمار کلی
+//  📊 آمار
 // ============================================
 app.get('/api/stats', (req, res) => {
-    try {
-        const db = readDB();
-        let total = 0;
-        for (const key in db) {
-            total += db[key].length;
-        }
-        res.json({
-            success: true,
-            totalRegistrations: total,
-            totalReferrers: Object.keys(db).length
-        });
-    } catch (e) {
-        res.json({ success: false, error: 'server_error' });
+    const db = readDB();
+    let total = 0;
+    for (const key in db) {
+        total += db[key].length;
     }
+    res.json({
+        success: true,
+        totalRegistrations: total,
+        totalReferrers: Object.keys(db).length
+    });
 });
 
 // ============================================
@@ -160,9 +207,11 @@ app.get('/', (req, res) => {
     res.json({
         status: 'online',
         service: 'Benula Webhook',
-        version: '2.0.0',
+        version: '3.0.0',
         storage: 'file',
-        dbFile: DB_FILE
+        dbFile: DB_FILE,
+        cleanup: 'auto (on startup)',
+        maxAge: '72 hours'
     });
 });
 
@@ -170,7 +219,18 @@ app.get('/', (req, res) => {
 //  🚀 شروع سرور
 // ============================================
 app.listen(PORT, () => {
-    console.log(`🚀 Webhook server running on port ${PORT}`);
-    console.log(`📁 Data directory: ${DATA_DIR}`);
+    console.log(`🚀 Server on port ${PORT}`);
+    console.log(`📁 Data: ${DATA_DIR}`);
+
     ensureDir();
+
+    // 🧹 پاک‌سازی خودکار در شروع
+    cleanupOldReferrals();
+
+    // 🧹 پاک‌سازی هر ۱ ساعت یه بار (وقتی سرور روشنه)
+    setInterval(() => {
+        cleanupOldReferrals();
+    }, 60 * 60 * 1000);  // هر ۱ ساعت
+
+    console.log(`⏰ Auto-cleanup scheduled every 1 hour`);
 });
